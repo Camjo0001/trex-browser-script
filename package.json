@@ -1,0 +1,15 @@
+{
+  "name": "trex-browser-script",
+  "version": "1.0.0",
+  "description": "Fast Playwright script for scraping NY Courts foreclosure cases",
+  "main": "scrape-case.js",
+  "scripts": {
+    "scrape": "node scrape-case.js"
+  },
+  "keywords": ["foreclosure", "playwright", "scraper", "ny-courts"],
+  "author": "Camjo",
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer-core": "^22.0.0"
+  }
+}
