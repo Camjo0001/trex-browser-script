@@ -1,23 +1,46 @@
 #!/usr/bin/env node
 /**
- * Playwright Court Scraper - Downloads PDFs then closes tab
+ * Playwright Court Scraper - Downloads PDFs with dashboard updates
  * 
  * Usage:
- *   node scrape-case.js "606529/2023" "Suffolk"
- * 
- * Output:
- *   JSON with PDF paths ready for vision processing
+ *   node scrape-case.js "606529/2023" "Suffolk" [jobId]
  */
 
 const puppeteer = require('puppeteer-core');
 const path = require('path');
 const fs = require('fs');
+const { Pool } = require('pg');
 
 const CDP_URL = 'http://127.0.0.1:18800';
 const SEARCH_URL = 'https://iapps.courts.state.ny.us/webcivil/FCASSearch';
 const DOWNLOAD_DIR = '/tmp/trex-pdfs';
 
-async function scrapeCase(indexNumber, county) {
+// Load config for DB connection
+let pool = null;
+try {
+  const config = require('../config.json');
+  pool = new Pool({ 
+    connectionString: config.database.connectionString, 
+    ssl: { rejectUnauthorized: false } 
+  });
+} catch (e) {
+  // No config, skip dashboard updates
+}
+
+async function updateDashboard(indexNumber, step, status = 'searching') {
+  if (!pool) return;
+  const agentId = `scraper-${indexNumber.replace('/', '-')}`;
+  try {
+    await pool.query(
+      `UPDATE agent_status SET current_step = $1, status = $2, last_update = NOW() WHERE agent_id = $3`,
+      [step, status, agentId]
+    );
+  } catch (e) {
+    // Ignore dashboard update errors
+  }
+}
+
+async function scrapeCase(indexNumber, county, jobId = null) {
   const caseDir = path.join(DOWNLOAD_DIR, indexNumber.replace('/', '-'));
   fs.mkdirSync(caseDir, { recursive: true });
 
@@ -27,7 +50,6 @@ async function scrapeCase(indexNumber, county) {
     county,
     caseDir,
     pdfs: {},
-    images: {},
     error: null,
     hcaptchaDetected: false,
     caseInfo: null,
@@ -37,18 +59,16 @@ async function scrapeCase(indexNumber, county) {
   let browser, page;
 
   try {
-    console.log(`[1/7] Connecting to browser...`);
+    await updateDashboard(indexNumber, 'Connecting to browser...');
     browser = await puppeteer.connect({ browserURL: CDP_URL, defaultViewport: null });
     page = await browser.newPage();
     
-    console.log(`[2/7] Opening search page...`);
+    await updateDashboard(indexNumber, 'Searching for case...');
     await page.goto(SEARCH_URL, { waitUntil: 'networkidle2', timeout: 60000 });
     await page.waitForSelector('#txtIndex', { timeout: 30000 });
 
-    console.log(`[3/7] Searching for ${indexNumber}...`);
     await page.type('#txtIndex', indexNumber, { delay: 50 });
     
-    // Select county
     const countyValue = await page.evaluate((county) => {
       const select = document.querySelector('select[name="cboCourt"]');
       if (!select) return null;
@@ -70,19 +90,20 @@ async function scrapeCase(indexNumber, county) {
       result.hcaptchaDetected = true;
       result.hcaptchaSitekey = await page.$eval('[data-sitekey]', el => el.getAttribute('data-sitekey')).catch(() => null);
       result.error = 'hCaptcha detected';
+      await updateDashboard(indexNumber, 'hCaptcha detected - needs solving', 'failed');
       await page.close();
       return result;
     }
 
-    // Find case
     const caseLink = await page.$('a[onclick*="openCaseDetailsWindow"]');
     if (!caseLink) {
       result.error = 'No case found';
+      await updateDashboard(indexNumber, 'No case found', 'failed');
       await page.close();
       return result;
     }
 
-    console.log(`[4/7] Navigating to case details...`);
+    await updateDashboard(indexNumber, 'Found case, navigating...');
     const onclick = await page.$eval('a[onclick*="openCaseDetailsWindow"]', el => el.getAttribute('onclick'));
     const params = onclick.match(/openCaseDetailsWindow\(([^)]+)\)/)[1].split(',').map(p => p.trim().replace(/['"]/g, ''));
     
@@ -90,17 +111,17 @@ async function scrapeCase(indexNumber, county) {
     
     await page.goto(caseUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
-    // Get basic case info
     const caseText = await page.evaluate(() => document.body.innerText);
     result.caseInfo = {
       plaintiff: (caseText.match(/Plaintiff[s]?[:\s]+([^\n]+)/i) || [])[1]?.trim(),
       defendant: (caseText.match(/Defendant[s]?[:\s]+([^\n]+)/i) || [])[1]?.trim()
     };
 
-    console.log(`[5/7] Navigating to eFiled documents...`);
+    await updateDashboard(indexNumber, 'Getting eFiled documents...');
     const efiledOnclick = await page.$eval('input[onclick*="openDocumentWindow"]', el => el.getAttribute('onclick')).catch(() => null);
     if (!efiledOnclick) {
       result.error = 'No eFiled docs button';
+      await updateDashboard(indexNumber, 'No eFiled documents found', 'failed');
       await page.close();
       return result;
     }
@@ -110,7 +131,6 @@ async function scrapeCase(indexNumber, county) {
     
     await page.goto(efiledUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
-    console.log(`[6/7] Finding documents...`);
     const docs = await page.evaluate(() => {
       const results = [];
       document.querySelectorAll('table tr').forEach(row => {
@@ -137,12 +157,16 @@ async function scrapeCase(indexNumber, county) {
 
     if (docs.length === 0) {
       result.error = 'No target documents found';
+      await updateDashboard(indexNumber, 'No Judgment/Notice found', 'failed');
       await page.close();
       return result;
     }
     result.documents = docs;
 
-    console.log(`[7/7] Downloading ${docs.length} PDF(s)...`);
+    // Download PDFs with progress
+    await updateDashboard(indexNumber, `Getting PDFs (0/${docs.length})...`);
+    let downloaded = 0;
+    
     for (const doc of docs) {
       const filename = doc.type === 'judgment' ? 'judgment.pdf' : 'notice.pdf';
       const filepath = path.join(caseDir, filename);
@@ -160,22 +184,26 @@ async function scrapeCase(indexNumber, county) {
         
         fs.writeFileSync(filepath, Buffer.from(base64, 'base64'));
         result.pdfs[doc.type] = filepath;
-        console.log(`   ✓ ${filename}`);
+        downloaded++;
+        await updateDashboard(indexNumber, `Getting PDFs (${downloaded}/${docs.length})...`);
       } catch (e) {
-        console.log(`   ✗ ${filename}: ${e.message}`);
+        // Continue on error
       }
     }
 
-    // Close tab immediately after downloads
-    console.log(`[✓] Closing browser tab...`);
+    // Close tab
     await page.close();
     page = null;
 
     result.success = Object.keys(result.pdfs).length > 0;
+    
+    if (result.success) {
+      await updateDashboard(indexNumber, `PDFs downloaded, ready for scan`);
+    }
 
   } catch (err) {
     result.error = err.message;
-    console.error(`[ERROR] ${err.message}`);
+    await updateDashboard(indexNumber, `Error: ${err.message}`, 'failed');
   } finally {
     if (page) await page.close().catch(() => {});
   }
@@ -183,16 +211,22 @@ async function scrapeCase(indexNumber, county) {
   return result;
 }
 
+async function cleanup() {
+  if (pool) await pool.end().catch(() => {});
+}
+
 if (require.main === module) {
-  const [indexNumber, county] = process.argv.slice(2);
+  const [indexNumber, county, jobId] = process.argv.slice(2);
   if (!indexNumber || !county) {
-    console.log('Usage: node scrape-case.js "INDEX" "COUNTY"');
+    console.log('Usage: node scrape-case.js "INDEX" "COUNTY" [jobId]');
     process.exit(1);
   }
-  scrapeCase(indexNumber, county).then(r => {
-    console.log('\n' + JSON.stringify(r, null, 2));
-    process.exit(r.success ? 0 : 1);
+  scrapeCase(indexNumber, county, jobId).then(r => {
+    console.log(JSON.stringify(r, null, 2));
+    return cleanup();
+  }).then(() => {
+    process.exit(r?.success ? 0 : 1);
   });
 }
 
-module.exports = { scrapeCase };
+module.exports = { scrapeCase, updateDashboard, cleanup };
